@@ -115,6 +115,10 @@ if __name__=='__main__':
   #if test_n_way is smaller than train_n_way, reduce n_query to keep batch size small
   n_query = max(1, int(16* params.test_n_way/params.train_n_way))
 
+  custom_params = dict(enable_factor_decomposition=params.enable_factor_decomposition,
+                     enable_mutual_info_loss=params.enable_mutual_info_loss,
+                     enable_policy=params.enable_policy)
+
   train_few_shot_params    = dict(n_way = params.train_n_way, n_support = params.n_shot)
   base_datamgr            = SetDataManager(image_size, n_query = n_query,  **train_few_shot_params)
   base_loader             = base_datamgr.get_data_loader( base_file , aug = params.train_aug )
@@ -123,7 +127,7 @@ if __name__=='__main__':
   val_datamgr             = SetDataManager(image_size, n_query = n_query, **test_few_shot_params)
   val_loader              = val_datamgr.get_data_loader( val_file, aug = False)
 
-  model           = StyleAdvGNN( model_dict[params.model], tf_path=params.tf_dir, **train_few_shot_params)
+  model = StyleAdvGNN(model_dict[params.model], tf_path=params.tf_dir, **train_few_shot_params, **custom_params)
   model = model.cuda()
 
   # load model
