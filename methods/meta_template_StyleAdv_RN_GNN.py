@@ -4,11 +4,64 @@ import numpy as np
 from abc import abstractmethod
 from tensorboardX import SummaryWriter
 import torch.nn.functional as F
+from torch.autograd import Variable
 from methods.tool_func import consistency_loss
+from .backbone_multiblock import *
 
- 
+
+pi = Variable(torch.FloatTensor([math.pi])).cuda()
+
+def normal(x, mu, sigma_sq):
+    a = (-1*(Variable(x)-mu).pow(2)/(2*sigma_sq)).exp()
+    b = 1/(2*sigma_sq*pi.expand_as(sigma_sq)).sqrt()
+    return a*b
+
+class Policy(nn.Module):
+  def __init__(self, obs_dim, action_dim):
+    super(Policy, self).__init__()
+    self.obs_dim = obs_dim
+    self.action_dim = action_dim
+
+    self.layer = nn.Sequential(
+        Conv2d_fw(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+        BatchNorm2d_fw(64),
+        nn.Flatten(),
+    )
+    self.mu = nn.Linear(802816, action_dim) # 3 * 244 * 244
+    self.std = nn.Linear(802816, action_dim) # 3 * 244 * 244
+
+  def forward(self, state):
+    if len(state.shape) == 5:
+      n_way, n_query, c, w, h = state.shape
+      state = state.view(n_way*n_query, c, w, h)
+    feature = self.layer(state)
+    mu = self.mu(feature)
+    mu = torch.clamp(mu, min=0.008, max=0.8).mean(axis=0)
+    std = self.std(feature).mean(axis=0)
+
+    return mu.cuda(), std.cuda()
+
+  def sample_action(self, state):
+    mu, std = self.forward(state)
+    std = F.softplus(std)
+
+    eps = torch.randn(mu.size())
+
+    action = (mu + std.sqrt() * Variable(eps).cuda()).data
+    prob = normal(action, mu, std)
+    entropy = -0.5*((std+2*pi.expand_as(std)).log()+1)
+
+    log_prob = prob.log()
+    return action, log_prob, entropy
+
+
 class MetaTemplate(nn.Module):
-  def __init__(self, model_func, n_way, n_support, flatten=True, leakyrelu=False, tf_path=None, change_way=True):
+  def __init__(self, model_func, n_way, n_support, flatten=True, leakyrelu=False, tf_path=None, change_way=True,
+               enable_factor_decomposition=False,
+               enable_mutual_info_loss=False,
+               feature_dims=[64, 128, 256],
+               enable_policy=False,
+              ):
     super(MetaTemplate, self).__init__()
     self.n_way      = n_way
     self.n_support  = n_support
@@ -18,6 +71,18 @@ class MetaTemplate(nn.Module):
     self.change_way = change_way  #some methods allow different_way classification during training and test
     self.tf_writer = SummaryWriter(log_dir=tf_path) if tf_path is not None else None
 
+    self.enable_factor_decomposition = enable_factor_decomposition
+    self.enable_mutual_info_loss = enable_mutual_info_loss
+    self.feature_dims = feature_dims
+
+    self.enable_policy = enable_policy
+    if self.enable_policy:
+        self.policy = Policy(obs_dim=1, action_dim=3)
+        self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=0.001)
+    else:
+        self.policy = None
+        self.policy_optimizer = None
+         
   @abstractmethod
   def set_forward(self,x,is_feature):
     pass
@@ -62,10 +127,29 @@ class MetaTemplate(nn.Module):
         self.n_way  = x_ori.size(0)
       optimizer.zero_grad()
 
-      epsilon_list = [0.8, 0.08, 0.008]
+      if self.enable_policy:
+          epsilon_list, log_prob, entropy = self.policy.sample_action(x_ori)
+      else:
+          epsilon_list = [0.8, 0.08, 0.008]
 
-      scores_fsl_ori, loss_fsl_ori, scores_cls_ori, loss_cls_ori, scores_fsl_adv, loss_fsl_adv, scores_cls_adv, loss_cls_adv = self.set_forward_loss_StyAdv(x_ori, global_y, epsilon_list)
+      if not self.enable_factor_decomposition:
+          scores_fsl_ori, loss_fsl_ori, scores_cls_ori, loss_cls_ori, scores_fsl_adv, loss_fsl_adv, scores_cls_adv, loss_cls_adv = self.set_forward_loss_StyAdv(
+              x_ori, global_y, epsilon_list)
+      else:
+          (scores_fsl_ori, loss_fsl_ori, scores_cls_ori, loss_cls_ori,
+           scores_fsl_adv, loss_fsl_adv, scores_cls_adv, loss_cls_adv,
+           factor_recon_loss, mi_loss) = self.set_forward_loss_with_factors(
+              x_ori, global_y, epsilon_list)
 
+     if self.enable_policy:
+        # update
+        reward = - (loss_fsl_adv + loss_cls_adv)
+        policy_loss = - (log_prob * (Variable(reward).expand_as(log_prob)).cuda()).sum() - (
+                    0.001 * entropy.cuda()).sum()
+
+        self.policy_optimizer.zero_grad()
+        policy_loss.backward()
+             
       # consistency loss between initial and styleAdv
       if(scores_fsl_ori.equal(scores_fsl_adv)):
         loss_fsl_KL = 0
@@ -79,8 +163,16 @@ class MetaTemplate(nn.Module):
       
   
       # final loss 
-      k1, k2, k3, k4, k5, k6 = 1, 1, 1, 1, 0, 0     
-      loss = k1 * loss_fsl_ori + k2 * loss_fsl_adv + k3 * loss_fsl_KL + k4 * loss_cls_ori + k5 * loss_cls_adv + k6 * loss_cls_KL
+      k1, k2, k3, k4, k5, k6 = 1, 1, 1, 1, 0, 0
+      if not self.enable_factor_decomposition:
+          loss = k1 * loss_fsl_ori + k2 * loss_fsl_adv + k3 * loss_fsl_KL + k4 * loss_cls_ori + k5 * loss_cls_adv + k6 * loss_cls_KL
+      else:
+          k_factor, k_mi = 0.1, 0.1  # Factor reconstruction and MI loss weights
+          base_loss = (k1 * loss_fsl_ori + k2 * loss_fsl_adv + k3 * loss_fsl_KL +
+                       k4 * loss_cls_ori + k5 * loss_cls_adv + k6 * loss_cls_KL)
+          factor_loss = k_factor * factor_recon_loss - k_mi * mi_loss  # Minimize MI
+          loss = base_loss + factor_loss
+   
       loss.backward()
       optimizer.step()
       avg_loss = avg_loss+loss.item()
