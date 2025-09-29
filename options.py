@@ -4,6 +4,14 @@ import glob
 import torch
 import argparse
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    v = v.lower()
+    if v in ('yes','true','t','y','1'): return True
+    if v in ('no','false','f','n','0'): return False
+    raise argparse.ArgumentTypeError('Boolean value expected.')
+  
 def parse_args(script):
   parser = argparse.ArgumentParser(description= 'few-shot script %s' %(script))
   parser.add_argument('--dataset', default='multi', help='miniImagenet/cub/cars/places/plantae, specify multi for training with multiple domains')
@@ -18,6 +26,13 @@ def parse_args(script):
   parser.add_argument('--save_dir'    , default='./output', type=str, help='')
   #parser.add_argument('--data_dir'    , default='./filelists', type=str, help='')
   parser.add_argument('--data_dir'    , default='/share/test/lovelyqian/CROSS-DOMAIN-FSL-DATASETS', type=str, help='')
+
+  parser.add_argument('--enable_factor_decomposition', type=str2bool, nargs='?', const=True, default=True,
+                      help='True/False; if flag used without value -> True')
+  parser.add_argument('--enable_mutual_info_loss', type=str2bool, nargs='?', const=True, default=True,
+                      help='True/False; if flag used without value -> True')
+  parser.add_argument('--enable_policy', type=str2bool, nargs='?', const=True, default=True,
+                      help='True/False; if flag used without value -> True')
 
   # for finetuning
   parser.add_argument('--finetune_epoch', default=50, type=int, help='')
