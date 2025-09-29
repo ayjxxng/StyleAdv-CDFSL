@@ -11,8 +11,48 @@ from methods.meta_template_StyleAdv_RN_GNN import MetaTemplate
 
 class StyleAdvGNN(MetaTemplate):
   maml=False
-  def __init__(self, model_func,  n_way, n_support, tf_path=None):
-    super(StyleAdvGNN, self).__init__(model_func, n_way, n_support, tf_path=tf_path)
+  def __init__(self, model_func,  n_way, n_support, tf_path=None,
+               enable_factor_decomposition=False,
+               enable_mutual_info_loss=False,
+               feature_dims=[64, 128, 256],
+               enable_policy=False
+              ):
+    super(StyleAdvGNN, self).__init__(model_func, n_way, n_support, tf_path=tf_path,
+                                      enable_factor_decomposition=enable_factor_decomposition,
+                                      enable_mutual_info_loss=enable_mutual_info_loss,
+                                      feature_dims=feature_dims,
+                                      enable_policy=enable_policy)
+
+    if enable_factor_decomposition:
+        self.block_decomposers = nn.ModuleDict()
+        self.block_reconstructors = nn.ModuleDict()
+        self.block_mi_estimators = nn.ModuleDict()
+
+        for i, dim in enumerate(feature_dims):
+            block_name = f'block{i + 1}'
+
+            # Identity/Style decomposer for each block
+            self.block_decomposers[f'{block_name}_identity'] = nn.Sequential(
+                nn.Linear(dim, dim // 2), nn.ReLU(),
+                nn.Linear(dim // 2, dim // 4)
+            )
+            self.block_decomposers[f'{block_name}_style'] = nn.Sequential(
+                nn.Linear(dim, dim // 2), nn.ReLU(),
+                nn.Linear(dim // 2, dim // 4)
+            )
+
+            # Factor reconstructor for each block
+            self.block_reconstructors[block_name] = nn.Sequential(
+                nn.Linear(dim // 2, dim // 2), nn.ReLU(),
+                nn.Linear(dim // 2, dim)
+            )
+
+            # Mutual information estimator for each block
+            if enable_mutual_info_loss:
+                self.block_mi_estimators[block_name] = nn.Sequential(
+                    nn.Linear(dim // 2, dim // 4), nn.ReLU(),
+                    nn.Linear(dim // 4, 1)
+                )
 
     # loss function
     self.loss_fn = nn.CrossEntropyLoss()
@@ -37,6 +77,12 @@ class StyleAdvGNN(MetaTemplate):
     self.gnn.cuda()
     self.classifier.cuda()
     self.support_label = self.support_label.cuda()
+
+    if self.enable_factor_decomposition:
+      self.block_decomposers.cuda()
+      self.block_reconstructors.cuda()
+      if self.enable_mutual_info_loss:
+          self.block_mi_estimators.cuda()
     return self
 
   def set_forward(self,x,is_feature=False):
@@ -58,9 +104,7 @@ class StyleAdvGNN(MetaTemplate):
     assert(z_stack[0].size(1) == self.n_way*(self.n_support + 1))
     scores = self.forward_gnn(z_stack)
     return scores
-
-
-
+        
   def forward_gnn(self, zs):
     # gnn inp: n_q * n_way(n_s + 1) * f
     nodes = torch.cat([torch.cat([z, self.support_label], dim=2) for z in zs], dim=0)
@@ -70,7 +114,6 @@ class StyleAdvGNN(MetaTemplate):
     scores = scores.view(self.n_query, self.n_way, self.n_support + 1, self.n_way)[:, :, -1].permute(1, 0, 2).contiguous().view(-1, self.n_way)
     return scores
 
-
   def set_forward_loss(self, x):
     y_query = torch.from_numpy(np.repeat(range( self.n_way ), self.n_query))
     y_query = y_query.cuda()
@@ -78,7 +121,352 @@ class StyleAdvGNN(MetaTemplate):
     loss = self.loss_fn(scores, y_query)
     return scores, loss
 
+  def decompose_block_representation(self, block_features, block_name):
+    if not self.enable_factor_decomposition:
+        return None, None, block_features, 0, 0
 
+    # Global average pooling for spatial features
+    if len(block_features.shape) == 4:  # [B, C, H, W]
+        pooled_features = F.adaptive_avg_pool2d(block_features, 1).squeeze(-1).squeeze(-1)
+    else:
+        pooled_features = block_features
+
+    # Decompose into identity and style factors
+    identity_factor = self.block_decomposers[f'{block_name}_identity'](pooled_features)
+    style_factor = self.block_decomposers[f'{block_name}_style'](pooled_features)
+
+    # Reconstruct original representation
+    factors_concat = torch.cat([identity_factor, style_factor], dim=1)
+    reconstructed_features = self.block_reconstructors[block_name](factors_concat)
+
+    # Reconstruction loss
+    recon_loss = F.mse_loss(reconstructed_features, pooled_features)
+
+    # Mutual information loss
+    mi_loss = self.compute_block_mutual_info_loss(identity_factor, style_factor, block_name)
+  
+    return identity_factor, style_factor, reconstructed_features, recon_loss, mi_loss
+
+  def compute_block_mutual_info_loss(self, identity_factor, style_factor, block_name):
+    if not self.enable_mutual_info_loss:
+        return 0
+
+    batch_size = identity_factor.size(0)
+
+    # Joint distribution
+    factors_joint = torch.cat([identity_factor, style_factor], dim=1)
+    joint_scores = self.block_mi_estimators[block_name](factors_joint)
+
+    # Marginal distribution (shuffle factors)
+    identity_shuffled = identity_factor[torch.randperm(batch_size)]
+    factors_marginal = torch.cat([identity_shuffled, style_factor], dim=1)
+    marginal_scores = self.block_mi_estimators[block_name](factors_marginal)
+
+    # Donsker-Varadhan estimation
+    mi_loss = torch.mean(joint_scores) - torch.log(torch.mean(torch.exp(marginal_scores)) + 1e-8)
+
+    return mi_loss
+
+  def factor_aware_style_attack(self, x_ori, y_ori, epsilon_list):
+    """Factor-aware adversarial attack"""
+    x_ori = x_ori.cuda()
+    y_ori = y_ori.cuda()
+    x_size = x_ori.size()
+    x_ori = x_ori.view(x_size[0] * x_size[1], x_size[2], x_size[3], x_size[4])
+    y_ori = y_ori.view(x_size[0] * x_size[1])
+
+    # Store adversarial factors for each block
+    adv_factors = {}
+    total_recon_loss = 0
+    total_mi_loss = 0
+
+    blocklist = 'block123'
+
+    # Block 1
+    if ('1' in blocklist and epsilon_list[0] != 0):
+        x_ori_block1 = self.feature.forward_block1(x_ori)
+
+        # Factor decomposition
+        identity_factor1, style_factor1, recon_feat1, recon_loss1, mi_loss1 = \
+            self.decompose_block_representation(x_ori_block1, 'block1')
+
+        total_recon_loss += recon_loss1
+        total_mi_loss += mi_loss1
+
+        # Attack only style factor, preserve identity
+        style_factor1_param = torch.nn.Parameter(style_factor1.clone())
+        style_factor1_param.requires_grad_()
+
+        # Reconstruct with attacked style for forward pass
+        factors_concat = torch.cat([identity_factor1.detach(), style_factor1_param], dim=1)
+        attacked_pooled_feat = self.block_reconstructors['block1'](factors_concat)
+        if len(x_ori_block1.shape) == 4:
+            B, C, H, W = x_ori_block1.shape
+            attacked_feat = attacked_pooled_feat.unsqueeze(-1).unsqueeze(-1).expand(B, C, H, W)
+        else:
+            attacked_feat = attacked_pooled_feat
+
+        # Forward pass with attacked features
+        x_ori_block2 = self.feature.forward_block2(attacked_feat)
+        x_ori_block3 = self.feature.forward_block3(x_ori_block2)
+        x_ori_block4 = self.feature.forward_block4(x_ori_block3)
+        x_ori_fea = self.feature.forward_rest(x_ori_block4)
+        x_ori_output = self.classifier.forward(x_ori_fea)
+
+        ori_loss = self.loss_fn(x_ori_output, y_ori)
+
+        self.feature.zero_grad()
+        self.classifier.zero_grad()
+        ori_loss.backward()
+
+        # FGSM attack on style factor
+        epsilon = epsilon_list[torch.randint(0, len(epsilon_list), (1,))[0]]
+        adv_style_factor1 = style_factor1 + epsilon * torch.sign(style_factor1_param.grad)
+
+        adv_factors['block1'] = {
+            'identity': identity_factor1.detach(),
+            'style': adv_style_factor1.detach()
+        }
+
+    # Block 2
+    self.feature.zero_grad()
+    self.classifier.zero_grad()
+
+    if ('2' in blocklist and epsilon_list[1] != 0):
+        x_ori_block1 = self.feature.forward_block1(x_ori)
+        factors_concat = torch.cat([
+            adv_factors['block1']['identity'],
+            adv_factors['block1']['style']
+        ], dim=1)
+        attacked_pooled_feat = self.block_reconstructors['block1'](factors_concat)
+        if len(x_ori_block1.shape) == 4:
+            B, C, H, W = x_ori_block1.shape
+            x_adv_block1 = attacked_pooled_feat.unsqueeze(-1).unsqueeze(-1).expand(B, C, H, W)
+        else:
+            x_adv_block1 = attacked_pooled_feat
+
+        x_ori_block2 = self.feature.forward_block2(x_adv_block1)
+
+        # Factor decomposition for block2
+        identity_factor2, style_factor2, recon_feat2, recon_loss2, mi_loss2 = \
+            self.decompose_block_representation(x_ori_block2, 'block2')
+
+        total_recon_loss += recon_loss2
+        total_mi_loss += mi_loss2
+
+        # Attack only style factor, preserve identity
+        style_factor2_param = torch.nn.Parameter(style_factor2.clone())
+        style_factor2_param.requires_grad_()
+
+        # Reconstruct with attacked style for forward pass
+        factors_concat = torch.cat([identity_factor2.detach(), style_factor2_param], dim=1)
+        attacked_pooled_feat = self.block_reconstructors['block2'](factors_concat)
+        if len(x_ori_block2.shape) == 4:
+            B, C, H, W = x_ori_block2.shape
+            attacked_feat = attacked_pooled_feat.unsqueeze(-1).unsqueeze(-1).expand(B, C, H, W)
+        else:
+            attacked_feat = attacked_pooled_feat
+
+        # Forward pass with attacked features
+        x_ori_block3 = self.feature.forward_block3(attacked_feat)
+        x_ori_block4 = self.feature.forward_block4(x_ori_block3)
+        x_ori_fea = self.feature.forward_rest(x_ori_block4)
+        x_ori_output = self.classifier.forward(x_ori_fea)
+
+        ori_loss = self.loss_fn(x_ori_output, y_ori)
+
+        self.feature.zero_grad()
+        self.classifier.zero_grad()
+        ori_loss.backward()
+
+        # FGSM attack on style factor
+        epsilon = epsilon_list[torch.randint(0, len(epsilon_list), (1,))[0]]
+        adv_style_factor2 = style_factor2 + epsilon * torch.sign(style_factor2_param.grad)
+
+        adv_factors['block2'] = {
+            'identity': identity_factor2.detach(),
+            'style': adv_style_factor2.detach()
+        }
+
+    if ('3' in blocklist and epsilon_list[2] != 0):
+        x_ori_block1 = self.feature.forward_block1(x_ori)
+        factors_concat = torch.cat([
+            adv_factors['block1']['identity'],
+            adv_factors['block1']['style']
+        ], dim=1)
+        attacked_pooled_feat = self.block_reconstructors['block1'](factors_concat)
+        if len(x_ori_block1.shape) == 4:
+            B, C, H, W = x_ori_block1.shape
+            x_adv_block1 = attacked_pooled_feat.unsqueeze(-1).unsqueeze(-1).expand(B, C, H, W)
+        else:
+            x_adv_block1 = attacked_pooled_feat
+
+        x_ori_block2 = self.feature.forward_block2(x_adv_block1)
+        factors_concat = torch.cat([
+            adv_factors['block2']['identity'],
+            adv_factors['block2']['style']
+        ], dim=1)
+        attacked_pooled_feat = self.block_reconstructors['block2'](factors_concat)
+        if len(x_ori_block2.shape) == 4:
+            B, C, H, W = x_ori_block2.shape
+            x_adv_block2 = attacked_pooled_feat.unsqueeze(-1).unsqueeze(-1).expand(B, C, H, W)
+        else:
+            x_adv_block2 = attacked_pooled_feat
+
+        x_ori_block3 = self.feature.forward_block3(x_adv_block2)
+
+        # Factor decomposition for block3
+        identity_factor3, style_factor3, recon_feat3, recon_loss3, mi_loss3 = \
+            self.decompose_block_representation(x_ori_block3, 'block3')
+
+        total_recon_loss += recon_loss3
+        total_mi_loss += mi_loss3
+
+        # Attack only style factor, preserve identity
+        style_factor3_param = torch.nn.Parameter(style_factor3.clone())
+        style_factor3_param.requires_grad_()
+
+        # Reconstruct with attacked style for forward pass
+        factors_concat = torch.cat([identity_factor3.detach(), style_factor3_param], dim=1)
+        attacked_pooled_feat = self.block_reconstructors['block3'](factors_concat)
+        if len(x_ori_block3.shape) == 4:
+            B, C, H, W = x_ori_block3.shape
+            attacked_feat = attacked_pooled_feat.unsqueeze(-1).unsqueeze(-1).expand(B, C, H, W)
+        else:
+            attacked_feat = attacked_pooled_feat
+
+        # Forward pass with attacked features
+        x_ori_block4 = self.feature.forward_block4(attacked_feat)
+        x_ori_fea = self.feature.forward_rest(x_ori_block4)
+        x_ori_output = self.classifier.forward(x_ori_fea)
+
+        ori_loss = self.loss_fn(x_ori_output, y_ori)
+
+        self.feature.zero_grad()
+        self.classifier.zero_grad()
+        ori_loss.backward()
+
+        # FGSM attack on style factor
+        epsilon = epsilon_list[torch.randint(0, len(epsilon_list), (1,))[0]]
+        adv_style_factor3 = style_factor3 + epsilon * torch.sign(style_factor3_param.grad)
+
+        adv_factors['block3'] = {
+            'identity': identity_factor3.detach(),
+            'style': adv_style_factor3.detach()
+        }
+
+    return adv_factors, total_recon_loss, total_mi_loss
+
+  def set_forward_loss_with_factors(self, x_ori, global_y, epsilon_list):
+    """Factor-aware forward pass"""
+    ##################################################################
+    # 0. first cp x_adv from x_ori
+    x_adv = x_ori
+
+    ##################################################################
+    # 1. styleAdv
+    self.set_statues_of_modules('eval')
+
+    # Get adversarial factors and losses
+    adv_factors, total_recon_loss, total_mi_loss = \
+        self.factor_aware_style_attack(x_ori, global_y, epsilon_list)
+
+    self.feature.zero_grad()
+    self.fc.zero_grad()
+    self.classifier.zero_grad()
+    self.gnn.zero_grad()
+
+    #################################################################
+    self.set_statues_of_modules('train')
+
+    # define y_query for FSL
+    y_query = torch.from_numpy(np.repeat(range(self.n_way), self.n_query))
+    y_query = y_query.cuda()
+
+    # Original forward pass
+    x_ori = x_ori.cuda()
+    x_size = x_ori.size()
+    x_ori = x_ori.view(x_size[0] * x_size[1], x_size[2], x_size[3], x_size[4])
+    global_y = global_y.view(x_size[0] * x_size[1]).cuda()
+    x_ori_block1 = self.feature.forward_block1(x_ori)
+    x_ori_block2 = self.feature.forward_block2(x_ori_block1)
+    x_ori_block3 = self.feature.forward_block3(x_ori_block2)
+    x_ori_block4 = self.feature.forward_block4(x_ori_block3)
+    x_ori_fea = self.feature.forward_rest(x_ori_block4)
+
+    scores_cls_ori = self.classifier.forward(x_ori_fea)
+    loss_cls_ori = self.loss_fn(scores_cls_ori, global_y)
+
+    # (2) Few-shot(GNN)
+    x_ori_z = self.fc(x_ori_fea) #  (d→z)
+    x_ori_z = x_ori_z.view(self.n_way, -1, x_ori_z.size(1))
+    x_ori_z_stack = [
+        torch.cat([x_ori_z[:, :self.n_support], x_ori_z[:, self.n_support + i:self.n_support + i + 1]], dim=1).view(
+            1, -1, x_ori_z.size(2)) for i in range(self.n_query)]
+    assert (x_ori_z_stack[0].size(1) == self.n_way * (self.n_support + 1))
+    scores_fsl_ori = self.forward_gnn(x_ori_z_stack)
+    loss_fsl_ori = self.loss_fn(scores_fsl_ori, y_query)
+
+    # Adversarial forward pass with factor application
+    x_adv = x_adv.cuda()
+    x_adv = x_adv.view(x_size[0] * x_size[1], x_size[2], x_size[3], x_size[4])
+
+    # Apply adversarial factors...
+    x_adv_block1 = self.feature.forward_block1(x_adv)
+    factors_concat = torch.cat([
+        adv_factors['block1']['identity'],
+        adv_factors['block1']['style']
+    ], dim=1)
+    attacked_pooled_feat = self.block_reconstructors['block1'](factors_concat)
+    if len(x_adv_block1.shape) == 4:
+        B, C, H, W = x_adv_block1.shape
+        x_adv_block1 = attacked_pooled_feat.unsqueeze(-1).unsqueeze(-1).expand(B, C, H, W)
+    else:
+        x_adv_block1 = attacked_pooled_feat
+
+    x_adv_block2 = self.feature.forward_block2(x_adv_block1)
+    factors_concat = torch.cat([
+        adv_factors['block2']['identity'],
+        adv_factors['block2']['style']
+    ], dim=1)
+    attacked_pooled_feat = self.block_reconstructors['block2'](factors_concat)
+    if len(x_adv_block2.shape) == 4:
+        B, C, H, W = x_adv_block2.shape
+        x_adv_block2 = attacked_pooled_feat.unsqueeze(-1).unsqueeze(-1).expand(B, C, H, W)
+    else:
+        x_adv_block2 = attacked_pooled_feat
+
+    x_adv_block3 = self.feature.forward_block3(x_adv_block2)
+    factors_concat = torch.cat([
+        adv_factors['block3']['identity'],
+        adv_factors['block3']['style']
+    ], dim=1)
+    attacked_pooled_feat = self.block_reconstructors['block3'](factors_concat)
+    if len(x_adv_block3.shape) == 4:
+        B, C, H, W = x_adv_block3.shape
+        x_adv_block3 = attacked_pooled_feat.unsqueeze(-1).unsqueeze(-1).expand(B, C, H, W)
+    else:
+        x_adv_block3 = attacked_pooled_feat
+
+    x_adv_block4 = self.feature.forward_block4(x_adv_block3)
+    x_adv_fea = self.feature.forward_rest(x_adv_block4)
+    scores_cls_adv = self.classifier.forward(x_adv_fea)
+    loss_cls_adv = self.loss_fn(scores_cls_adv, global_y)
+
+    # Adversarial FSL
+    x_adv_z = self.fc(x_adv_fea)
+    x_adv_z = x_adv_z.view(self.n_way, -1, x_adv_z.size(1))
+    x_adv_z_stack = [
+        torch.cat([x_adv_z[:, :self.n_support], x_adv_z[:, self.n_support + i:self.n_support + i + 1]], dim=1).view(
+            1, -1, x_adv_z.size(2)) for i in range(self.n_query)]
+    assert (x_adv_z_stack[0].size(1) == self.n_way * (self.n_support + 1))
+    scores_fsl_adv = self.forward_gnn(x_adv_z_stack)
+    loss_fsl_adv = self.loss_fn(scores_fsl_adv, y_query)
+
+    return (scores_fsl_ori, loss_fsl_ori, scores_cls_ori, loss_cls_ori,
+            scores_fsl_adv, loss_fsl_adv, scores_cls_adv, loss_cls_adv,
+            total_recon_loss, total_mi_loss)
+      
   def adversarial_attack_Incre(self, x_ori, y_ori, epsilon_list):
     x_ori = x_ori.cuda()
     y_ori = y_ori.cuda()
